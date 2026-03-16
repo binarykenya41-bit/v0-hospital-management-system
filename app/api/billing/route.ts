@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { getDb } from '@/lib/db'
+import { readDb, writeDb, generateId } from '@/lib/mock-db'
 
 export async function GET(request: Request) {
   const session = await getSession()
@@ -9,61 +9,69 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const status = searchParams.get('status') || ''
 
-  const sql = getDb()
+  const db = readDb()
+  let invoices = db.invoices as Record<string, unknown>[]
 
-  const invoices = await sql`
-    SELECT i.*, 
-      p.first_name as patient_first_name, p.last_name as patient_last_name, p.patient_number
-    FROM invoices i
-    JOIN patients p ON i.patient_id = p.id
-    WHERE i.deleted_at IS NULL
-    ${status ? sql`AND i.status = ${status}` : sql``}
-    ORDER BY i.created_at DESC
-    LIMIT 50
-  `
+  if (status) {
+    invoices = invoices.filter((i) => i.status === status)
+  }
 
-  return NextResponse.json({ invoices })
+  invoices = [...invoices].sort(
+    (a, b) => String(b.created_at).localeCompare(String(a.created_at))
+  )
+
+  return NextResponse.json({ invoices: invoices.slice(0, 50) })
 }
 
 export async function POST(request: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const sql = getDb()
+  const db = readDb()
   const body = await request.json()
 
-  // Generate invoice number
-  const lastInvoice = await sql`SELECT invoice_number FROM invoices ORDER BY created_at DESC LIMIT 1`
-  let nextNum = 1
-  if (lastInvoice.length > 0) {
-    const parts = lastInvoice[0].invoice_number.split('-')
-    nextNum = parseInt(parts[parts.length - 1]) + 1
-  }
+  const patient = db.patients.find((p) => (p as Record<string, unknown>).id === body.patient_id) as Record<string, unknown> | undefined
+
+  const nextNum = db.invoices.length + 1
   const invoiceNumber = `INV-2026-${String(nextNum).padStart(5, '0')}`
 
-  const result = await sql`
-    INSERT INTO invoices (
-      invoice_number, patient_id, billing_type, sha_number,
-      insurance_provider, insurance_number, subtotal, total, balance,
-      status, created_by
-    ) VALUES (
-      ${invoiceNumber}, ${body.patient_id}, ${body.billing_type || 'Cash'},
-      ${body.sha_number || null}, ${body.insurance_provider || null},
-      ${body.insurance_number || null}, ${body.subtotal || 0}, ${body.total || 0},
-      ${body.total || 0}, 'pending', ${session.id}
-    ) RETURNING *
-  `
+  const newInvoice: Record<string, unknown> = {
+    id: generateId('inv'),
+    invoice_number: invoiceNumber,
+    patient_id: body.patient_id,
+    billing_type: body.billing_type || 'Cash',
+    sha_number: body.sha_number || null,
+    insurance_provider: body.insurance_provider || null,
+    insurance_number: body.insurance_number || null,
+    subtotal: body.subtotal || 0,
+    total: body.total || 0,
+    amount_paid: 0,
+    balance: body.total || 0,
+    status: 'pending',
+    created_by: session.id,
+    created_at: new Date().toISOString(),
+    patient_first_name: patient ? patient.first_name : null,
+    patient_last_name: patient ? patient.last_name : null,
+    patient_number: patient ? patient.patient_number : null,
+  }
 
-  // Insert items if provided
+  db.invoices.push(newInvoice)
+
   if (body.items && Array.isArray(body.items)) {
     for (const item of body.items) {
-      await sql`
-        INSERT INTO invoice_items (invoice_id, description, category, quantity, unit_price, total)
-        VALUES (${result[0].id}, ${item.description}, ${item.category || null}, 
-                ${item.quantity || 1}, ${item.unit_price}, ${item.total})
-      `
+      db.invoice_items.push({
+        id: generateId('ii'),
+        invoice_id: newInvoice.id,
+        description: item.description,
+        category: item.category || null,
+        quantity: item.quantity || 1,
+        unit_price: item.unit_price,
+        total: item.total,
+      })
     }
   }
 
-  return NextResponse.json(result[0], { status: 201 })
+  writeDb(db)
+
+  return NextResponse.json(newInvoice, { status: 201 })
 }

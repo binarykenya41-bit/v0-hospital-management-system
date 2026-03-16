@@ -1,26 +1,27 @@
-import { neon } from '@neondatabase/serverless'
-
-const sql = neon(process.env.DATABASE_URL!)
+import { NextResponse } from 'next/server'
+import { getSession } from '@/lib/auth'
+import { readDb } from '@/lib/mock-db'
 
 export async function GET(request: Request) {
-  try {
-    const { searchParams } = new URL(request.url)
-    const search = searchParams.get('search') || ''
+  const session = await getSession()
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-    const suppliers = await sql`
-      SELECT id, name, contact_person, phone, email, county, supplier_type, is_active
-      FROM suppliers
-      WHERE is_active = true
-        AND (name ILIKE ${'%' + search + '%'} OR contact_person ILIKE ${'%' + search + '%'})
-      ORDER BY name ASC
-    `
+  const { searchParams } = new URL(request.url)
+  const search = searchParams.get('search') || ''
 
-    return Response.json({ suppliers })
-  } catch (error) {
-    console.error('Error fetching suppliers:', error)
-    return Response.json(
-      { error: 'Failed to fetch suppliers' },
-      { status: 500 }
+  const db = readDb()
+  let suppliers = (db.suppliers as Record<string, unknown>[]).filter((s) => s.is_active)
+
+  if (search) {
+    const q = search.toLowerCase()
+    suppliers = suppliers.filter(
+      (s) =>
+        String(s.name).toLowerCase().includes(q) ||
+        String(s.contact_person || '').toLowerCase().includes(q)
     )
   }
+
+  suppliers.sort((a, b) => String(a.name).localeCompare(String(b.name)))
+
+  return NextResponse.json({ suppliers })
 }

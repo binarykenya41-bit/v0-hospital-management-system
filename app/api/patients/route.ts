@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { getDb } from '@/lib/db'
+import { readDb, writeDb, generateId } from '@/lib/mock-db'
 
 export async function GET(request: Request) {
   const session = await getSession()
@@ -10,52 +10,31 @@ export async function GET(request: Request) {
   const search = searchParams.get('search') || ''
   const page = parseInt(searchParams.get('page') || '1')
   const limit = parseInt(searchParams.get('limit') || '20')
-  const offset = (page - 1) * limit
 
-  const sql = getDb()
-
-  let patients, total
+  const db = readDb()
+  let patients = db.patients as Record<string, unknown>[]
 
   if (search) {
-    patients = await sql`
-      SELECT * FROM patients 
-      WHERE deleted_at IS NULL 
-        AND (
-          first_name ILIKE ${'%' + search + '%'} 
-          OR last_name ILIKE ${'%' + search + '%'}
-          OR patient_number ILIKE ${'%' + search + '%'}
-          OR national_id ILIKE ${'%' + search + '%'}
-          OR sha_number ILIKE ${'%' + search + '%'}
-        )
-      ORDER BY created_at DESC 
-      LIMIT ${limit} OFFSET ${offset}
-    `
-    total = await sql`
-      SELECT COUNT(*) as count FROM patients 
-      WHERE deleted_at IS NULL 
-        AND (
-          first_name ILIKE ${'%' + search + '%'} 
-          OR last_name ILIKE ${'%' + search + '%'}
-          OR patient_number ILIKE ${'%' + search + '%'}
-          OR national_id ILIKE ${'%' + search + '%'}
-          OR sha_number ILIKE ${'%' + search + '%'}
-        )
-    `
-  } else {
-    patients = await sql`
-      SELECT * FROM patients 
-      WHERE deleted_at IS NULL 
-      ORDER BY created_at DESC 
-      LIMIT ${limit} OFFSET ${offset}
-    `
-    total = await sql`SELECT COUNT(*) as count FROM patients WHERE deleted_at IS NULL`
+    const q = search.toLowerCase()
+    patients = patients.filter(
+      (p) =>
+        String(p.first_name).toLowerCase().includes(q) ||
+        String(p.last_name).toLowerCase().includes(q) ||
+        String(p.patient_number).toLowerCase().includes(q) ||
+        String(p.national_id || '').toLowerCase().includes(q) ||
+        String(p.sha_number || '').toLowerCase().includes(q)
+    )
   }
 
+  const total = patients.length
+  const offset = (page - 1) * limit
+  const paginated = patients.slice(offset, offset + limit)
+
   return NextResponse.json({
-    patients,
-    total: Number(total[0].count),
+    patients: paginated,
+    total,
     page,
-    totalPages: Math.ceil(Number(total[0].count) / limit),
+    totalPages: Math.ceil(total / limit),
   })
 }
 
@@ -63,40 +42,43 @@ export async function POST(request: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const sql = getDb()
+  const db = readDb()
   const body = await request.json()
 
-  // Generate patient number
-  const lastPatient = await sql`
-    SELECT patient_number FROM patients 
-    ORDER BY created_at DESC LIMIT 1
-  `
-  let nextNum = 1
-  if (lastPatient.length > 0) {
-    const parts = lastPatient[0].patient_number.split('-')
-    nextNum = parseInt(parts[parts.length - 1]) + 1
-  }
+  const nextNum = db.patients.length + 1
   const patientNumber = `MTRH-2026-${String(nextNum).padStart(4, '0')}`
 
-  const result = await sql`
-    INSERT INTO patients (
-      patient_number, national_id, first_name, last_name, other_names,
-      date_of_birth, gender, phone, email, county, sub_county, ward,
-      address, blood_group, sha_number, insurance_provider, insurance_number,
-      next_of_kin_name, next_of_kin_phone, next_of_kin_relationship,
-      emergency_contact_name, emergency_contact_phone, emergency_contact_relationship,
-      referral_source, referral_hospital, patient_type, created_by
-    ) VALUES (
-      ${patientNumber}, ${body.national_id}, ${body.first_name}, ${body.last_name}, ${body.other_names || null},
-      ${body.date_of_birth || null}, ${body.gender}, ${body.phone || null}, ${body.email || null}, 
-      ${body.county || null}, ${body.sub_county || null}, ${body.ward || null},
-      ${body.address || null}, ${body.blood_group || null}, ${body.sha_number || null}, 
-      ${body.insurance_provider || null}, ${body.insurance_number || null},
-      ${body.next_of_kin_name || null}, ${body.next_of_kin_phone || null}, ${body.next_of_kin_relationship || null},
-      ${body.emergency_contact_name || null}, ${body.emergency_contact_phone || null}, ${body.emergency_contact_relationship || null},
-      ${body.referral_source || null}, ${body.referral_hospital || null}, ${body.patient_type || 'outpatient'}, ${session.id}
-    ) RETURNING *
-  `
+  const newPatient: Record<string, unknown> = {
+    id: generateId('p'),
+    patient_number: patientNumber,
+    national_id: body.national_id || null,
+    first_name: body.first_name,
+    last_name: body.last_name,
+    other_names: body.other_names || null,
+    date_of_birth: body.date_of_birth || null,
+    gender: body.gender,
+    phone: body.phone || null,
+    email: body.email || null,
+    county: body.county || null,
+    sub_county: body.sub_county || null,
+    ward: body.ward || null,
+    address: body.address || null,
+    blood_group: body.blood_group || null,
+    sha_number: body.sha_number || null,
+    insurance_provider: body.insurance_provider || null,
+    insurance_number: body.insurance_number || null,
+    next_of_kin_name: body.next_of_kin_name || null,
+    next_of_kin_phone: body.next_of_kin_phone || null,
+    next_of_kin_relationship: body.next_of_kin_relationship || null,
+    referral_source: body.referral_source || null,
+    referral_hospital: body.referral_hospital || null,
+    patient_type: body.patient_type || 'outpatient',
+    created_by: session.id,
+    created_at: new Date().toISOString(),
+  }
 
-  return NextResponse.json(result[0], { status: 201 })
+  db.patients.push(newPatient)
+  writeDb(db)
+
+  return NextResponse.json(newPatient, { status: 201 })
 }

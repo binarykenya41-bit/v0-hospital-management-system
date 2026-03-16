@@ -1,110 +1,123 @@
-import { neon } from '@neondatabase/serverless'
-
-const sql = neon(process.env.DATABASE_URL!)
+import { NextResponse } from 'next/server'
+import { getSession } from '@/lib/auth'
+import { readDb } from '@/lib/mock-db'
 
 export async function GET(request: Request) {
-  try {
-    const { searchParams } = new URL(request.url)
-    const from = searchParams.get('from') || new Date(new Date().setMonth(new Date().getMonth() - 1)).toISOString().split('T')[0]
-    const to = searchParams.get('to') || new Date().toISOString().split('T')[0]
+  const session = await getSession()
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-    // Total patients
-    const totalPatientsResult = await sql`
-      SELECT COUNT(*) as count FROM patients WHERE registration_date::date <= ${to}
-    `
-    const totalPatients = Number(totalPatientsResult[0].count)
+  const { searchParams } = new URL(request.url)
+  const from = searchParams.get('from') || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  const to = searchParams.get('to') || new Date().toISOString().split('T')[0]
 
-    // Total revenue
-    const revenueResult = await sql`
-      SELECT COALESCE(SUM(total), 0) as total FROM invoices 
-      WHERE created_at::date BETWEEN ${from}::date AND ${to}::date
-    `
-    const totalRevenue = revenueResult[0].total
+  const db = readDb()
 
-    // Bed occupancy
-    const bedResult = await sql`
-      SELECT 
-        COALESCE(COUNT(DISTINCT bed_number), 0)::float / NULLIF(
-          (SELECT COUNT(DISTINCT bed_number) FROM admissions), 0
-        ) * 100 as occupancy
-      FROM admissions
-      WHERE status = 'admitted' 
-        AND admission_date::date BETWEEN ${from}::date AND ${to}::date
-    `
-    const bedOccupancy = Math.round(Number(bedResult[0].occupancy) || 0)
+  // Total patients registered up to 'to' date
+  const totalPatients = (db.patients as Record<string, unknown>[]).filter(
+    (p) => String(p.created_at).split('T')[0] <= to
+  ).length
 
-    // Lab turnaround
-    const labResult = await sql`
-      SELECT EXTRACT(EPOCH FROM AVG(completed_at - requested_at)) / 3600 as hours
-      FROM lab_tests
-      WHERE status = 'completed' 
-        AND requested_at::date BETWEEN ${from}::date AND ${to}::date
-    `
-    const avgTurnaround = Math.round(Number(labResult[0].hours) || 0)
-
-    // Department metrics
-    const deptMetrics = await sql`
-      SELECT 
-        u.department,
-        COUNT(DISTINCT a.patient_id) as patient_count,
-        COALESCE(SUM(i.total), 0) as revenue,
-        EXTRACT(EPOCH FROM AVG(a.appointment_date - a.appointment_date))::int / 60 as avg_time
-      FROM users u
-      LEFT JOIN appointments a ON u.id = a.doctor_id
-      LEFT JOIN invoices i ON a.patient_id = i.patient_id
-      WHERE u.role_id IN (3, 4)
-        AND a.appointment_date::date BETWEEN ${from}::date AND ${to}::date
-      GROUP BY u.department
-      ORDER BY patient_count DESC
-    `
-
-    // Billing summary
-    const cashResult = await sql`
-      SELECT COALESCE(SUM(amount), 0) as total FROM payments
-      WHERE payment_method = 'cash' 
-        AND payment_date::date BETWEEN ${from}::date AND ${to}::date
-    `
-    const shaResult = await sql`
-      SELECT COALESCE(SUM(claim_amount), 0) as total FROM sha_claims
-      WHERE submission_date::date BETWEEN ${from}::date AND ${to}::date
-    `
-    const balanceResult = await sql`
-      SELECT COALESCE(SUM(balance), 0) as total FROM invoices
-      WHERE status != 'paid'
-    `
-
-    // Top medicines
-    const topMeds = await sql`
-      SELECT 
-        m.name,
-        SUM(pr.quantity)::int as quantity,
-        SUM(pr.quantity * m.unit_price) as total_cost
-      FROM prescriptions pr
-      JOIN medicines m ON pr.medicine_id = m.id
-      WHERE pr.created_at::date BETWEEN ${from}::date AND ${to}::date
-      GROUP BY m.id, m.name
-      ORDER BY quantity DESC
-      LIMIT 10
-    `
-
-    return Response.json({
-      totalPatients,
-      totalRevenue,
-      patientsTrend: '+5%',
-      revenueTrend: '+12%',
-      bedOccupancy,
-      avgTurnaround,
-      departmentMetrics: deptMetrics,
-      cashPayments: cashResult[0].total,
-      shaSubmitted: shaResult[0].total,
-      outstandingBalance: balanceResult[0].total,
-      topMedicines: topMeds,
+  // Total revenue from payments in range
+  const totalRevenue = (db.payments as Record<string, unknown>[])
+    .filter((p) => {
+      const d = String(p.payment_date)
+      return d >= from && d <= to
     })
-  } catch (error) {
-    console.error('Error fetching reports:', error)
-    return Response.json(
-      { error: 'Failed to fetch reports' },
-      { status: 500 }
-    )
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+
+  // Current admissions
+  const bedOccupancy = Math.round(
+    (db.admissions.filter((a) => (a as Record<string, unknown>).status === 'admitted').length / 800) * 100
+  )
+
+  // Lab turnaround (avg hours for completed tests in range)
+  const completedTests = (db.lab_tests as Record<string, unknown>[]).filter(
+    (t) =>
+      t.status === 'completed' &&
+      t.completed_at &&
+      String(t.requested_at).split('T')[0] >= from &&
+      String(t.requested_at).split('T')[0] <= to
+  )
+  let avgTurnaround = 0
+  if (completedTests.length > 0) {
+    const totalHours = completedTests.reduce((sum, t) => {
+      const diff = new Date(String(t.completed_at)).getTime() - new Date(String(t.requested_at)).getTime()
+      return sum + diff / (1000 * 60 * 60)
+    }, 0)
+    avgTurnaround = Math.round(totalHours / completedTests.length)
   }
+
+  // Department metrics
+  const users = db.users as Record<string, unknown>[]
+  const appointments = db.appointments as Record<string, unknown>[]
+  const invoices = db.invoices as Record<string, unknown>[]
+
+  const deptMap: Record<string, { patient_count: number; revenue: number }> = {}
+  for (const appt of appointments) {
+    const d = String(appt.appointment_date)
+    if (d < from || d > to) continue
+    const doc = users.find((u) => u.id === appt.doctor_id)
+    if (!doc) continue
+    const dept = String(doc.department || 'Unknown')
+    if (!deptMap[dept]) deptMap[dept] = { patient_count: 0, revenue: 0 }
+    deptMap[dept].patient_count++
+  }
+  for (const inv of invoices) {
+    const d = String(inv.created_at).split('T')[0]
+    if (d < from || d > to) continue
+    // Find the appointment for this patient to attribute to department
+    const appt = appointments.find((a) => a.patient_id === inv.patient_id)
+    if (!appt) continue
+    const doc = users.find((u) => u.id === appt.doctor_id)
+    if (!doc) continue
+    const dept = String(doc.department || 'Unknown')
+    if (!deptMap[dept]) deptMap[dept] = { patient_count: 0, revenue: 0 }
+    deptMap[dept].revenue += Number(inv.total)
+  }
+  const departmentMetrics = Object.entries(deptMap)
+    .map(([department, data]) => ({ department, ...data, avg_time: 30 }))
+    .sort((a, b) => b.patient_count - a.patient_count)
+
+  // Billing summary
+  const payments = (db.payments as Record<string, unknown>[]).filter((p) => {
+    const d = String(p.payment_date)
+    return d >= from && d <= to
+  })
+  const cashPayments = payments.filter((p) => p.payment_method === 'cash' || p.payment_method === 'mpesa')
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+  const shaSubmitted = payments.filter((p) => p.payment_method === 'sha')
+    .reduce((sum, p) => sum + Number(p.amount), 0)
+  const outstandingBalance = invoices
+    .filter((i) => i.status !== 'paid' && i.status !== 'cancelled')
+    .reduce((sum, i) => sum + Number(i.balance), 0)
+
+  // Top medicines by dispensing (use invoice items)
+  const invoiceItems = db.invoice_items as Record<string, unknown>[]
+  const medMap: Record<string, { quantity: number; total_cost: number }> = {}
+  for (const item of invoiceItems) {
+    if (String(item.category || '').toLowerCase() === 'pharmacy') {
+      const name = String(item.description)
+      if (!medMap[name]) medMap[name] = { quantity: 0, total_cost: 0 }
+      medMap[name].quantity += Number(item.quantity)
+      medMap[name].total_cost += Number(item.total)
+    }
+  }
+  const topMedicines = Object.entries(medMap)
+    .map(([name, data]) => ({ name, ...data }))
+    .sort((a, b) => b.quantity - a.quantity)
+    .slice(0, 10)
+
+  return NextResponse.json({
+    totalPatients,
+    totalRevenue,
+    patientsTrend: '+5%',
+    revenueTrend: '+12%',
+    bedOccupancy,
+    avgTurnaround,
+    departmentMetrics,
+    cashPayments,
+    shaSubmitted,
+    outstandingBalance,
+    topMedicines,
+  })
 }

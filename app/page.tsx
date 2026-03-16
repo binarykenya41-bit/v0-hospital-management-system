@@ -106,7 +106,7 @@ export default function LoginPage() {
           </form>
 
           <div className="mt-6 border-t border-border pt-4">
-            <p className="text-xs text-muted-foreground mb-2">Demo accounts (password: admin123):</p>
+            <p className="text-xs text-muted-foreground mb-2">Demo accounts (any password works):</p>
             <div className="grid grid-cols-2 gap-1">
               {[
                 { label: 'Admin', email: 'admin@hospital.go.ke' },

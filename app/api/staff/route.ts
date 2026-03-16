@@ -1,22 +1,29 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { getDb } from '@/lib/db'
+import { readDb } from '@/lib/mock-db'
 
 export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const sql = getDb()
-
-  const staff = await sql`
-    SELECT u.id, u.email, u.first_name, u.last_name, u.department,
-           u.phone, u.national_id, u.staff_number, u.is_active, u.last_login,
-           u.created_at, r.name as role_name, r.description as role_description
-    FROM users u
-    JOIN roles r ON u.role_id = r.id
-    WHERE u.deleted_at IS NULL
-    ORDER BY u.first_name ASC
-  `
+  const db = readDb()
+  const staff = (db.users as Record<string, unknown>[])
+    .map((u) => ({
+      id: u.id,
+      email: u.email,
+      first_name: u.first_name,
+      last_name: u.last_name,
+      department: u.department,
+      phone: u.phone,
+      national_id: u.national_id,
+      staff_number: u.staff_number,
+      is_active: u.is_active,
+      last_login: u.last_login,
+      created_at: u.created_at,
+      role_name: u.role_name,
+      role_description: null,
+    }))
+    .sort((a, b) => String(a.first_name).localeCompare(String(b.first_name)))
 
   return NextResponse.json({ staff })
 }

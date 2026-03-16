@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { getDb } from '@/lib/db'
+import { readDb, writeDb, generateId } from '@/lib/mock-db'
 
 export async function GET(request: Request) {
   const session = await getSession()
@@ -11,46 +11,33 @@ export async function GET(request: Request) {
   const status = searchParams.get('status')
   const page = parseInt(searchParams.get('page') || '1')
   const limit = parseInt(searchParams.get('limit') || '20')
-  const offset = (page - 1) * limit
 
-  const sql = getDb()
+  const db = readDb()
+  let appointments = db.appointments as Record<string, unknown>[]
 
-  let appointments
   if (date) {
-    appointments = await sql`
-      SELECT a.*, 
-        p.first_name as patient_first_name, p.last_name as patient_last_name, p.patient_number,
-        u.first_name as doctor_first_name, u.last_name as doctor_last_name
-      FROM appointments a
-      JOIN patients p ON a.patient_id = p.id
-      LEFT JOIN users u ON a.doctor_id = u.id
-      WHERE a.deleted_at IS NULL AND a.appointment_date = ${date}
-      ${status ? sql`AND a.status = ${status}` : sql``}
-      ORDER BY a.appointment_time ASC
-      LIMIT ${limit} OFFSET ${offset}
-    `
-  } else {
-    appointments = await sql`
-      SELECT a.*, 
-        p.first_name as patient_first_name, p.last_name as patient_last_name, p.patient_number,
-        u.first_name as doctor_first_name, u.last_name as doctor_last_name
-      FROM appointments a
-      JOIN patients p ON a.patient_id = p.id
-      LEFT JOIN users u ON a.doctor_id = u.id
-      WHERE a.deleted_at IS NULL
-      ${status ? sql`AND a.status = ${status}` : sql``}
-      ORDER BY a.appointment_date DESC, a.appointment_time ASC
-      LIMIT ${limit} OFFSET ${offset}
-    `
+    appointments = appointments.filter((a) => a.appointment_date === date)
+  }
+  if (status) {
+    appointments = appointments.filter((a) => a.status === status)
   }
 
-  const total = await sql`SELECT COUNT(*) as count FROM appointments WHERE deleted_at IS NULL`
+  // Sort by date desc, time asc
+  appointments = [...appointments].sort((a, b) => {
+    const dateCompare = String(b.appointment_date).localeCompare(String(a.appointment_date))
+    if (dateCompare !== 0) return dateCompare
+    return String(a.appointment_time).localeCompare(String(b.appointment_time))
+  })
+
+  const total = appointments.length
+  const offset = (page - 1) * limit
+  const paginated = appointments.slice(offset, offset + limit)
 
   return NextResponse.json({
-    appointments,
-    total: Number(total[0].count),
+    appointments: paginated,
+    total,
     page,
-    totalPages: Math.ceil(Number(total[0].count) / limit),
+    totalPages: Math.ceil(total / limit),
   })
 }
 
@@ -58,19 +45,38 @@ export async function POST(request: Request) {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const sql = getDb()
+  const db = readDb()
   const body = await request.json()
 
-  const result = await sql`
-    INSERT INTO appointments (
-      patient_id, doctor_id, appointment_date, appointment_time,
-      appointment_type, clinic, status, priority, reason, notes, created_by
-    ) VALUES (
-      ${body.patient_id}, ${body.doctor_id || null}, ${body.appointment_date}, ${body.appointment_time},
-      ${body.appointment_type}, ${body.clinic || null}, 'scheduled',
-      ${body.priority || 'normal'}, ${body.reason || null}, ${body.notes || null}, ${session.id}
-    ) RETURNING *
-  `
+  // Look up patient details
+  const patient = db.patients.find((p) => (p as Record<string, unknown>).id === body.patient_id) as Record<string, unknown> | undefined
+  const doctor = body.doctor_id
+    ? (db.users.find((u) => (u as Record<string, unknown>).id === body.doctor_id) as Record<string, unknown> | undefined)
+    : undefined
 
-  return NextResponse.json(result[0], { status: 201 })
+  const newAppointment: Record<string, unknown> = {
+    id: generateId('a'),
+    patient_id: body.patient_id,
+    doctor_id: body.doctor_id || null,
+    appointment_date: body.appointment_date,
+    appointment_time: body.appointment_time,
+    appointment_type: body.appointment_type,
+    clinic: body.clinic || null,
+    status: 'scheduled',
+    priority: body.priority || 'normal',
+    reason: body.reason || null,
+    notes: body.notes || null,
+    patient_first_name: patient ? patient.first_name : null,
+    patient_last_name: patient ? patient.last_name : null,
+    patient_number: patient ? patient.patient_number : null,
+    doctor_first_name: doctor ? doctor.first_name : null,
+    doctor_last_name: doctor ? doctor.last_name : null,
+    created_by: session.id,
+    created_at: new Date().toISOString(),
+  }
+
+  db.appointments.push(newAppointment)
+  writeDb(db)
+
+  return NextResponse.json(newAppointment, { status: 201 })
 }

@@ -1,28 +1,43 @@
 import { NextResponse } from 'next/server'
 import { getSession } from '@/lib/auth'
-import { getDb } from '@/lib/db'
+import { readDb } from '@/lib/mock-db'
 
 export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const sql = getDb()
+  const db = readDb()
+  const today = new Date().toISOString().split('T')[0]
 
-  const [patients, todayAppointments, admissions, medicines, labTests, revenue] = await Promise.all([
-    sql`SELECT COUNT(*) as count FROM patients WHERE deleted_at IS NULL`,
-    sql`SELECT COUNT(*) as count FROM appointments WHERE appointment_date = CURRENT_DATE AND deleted_at IS NULL`,
-    sql`SELECT COUNT(*) as count FROM admissions WHERE status = 'admitted' AND deleted_at IS NULL`,
-    sql`SELECT COUNT(*) as count FROM medicines WHERE quantity_in_stock <= reorder_level AND is_active = true AND deleted_at IS NULL`,
-    sql`SELECT COUNT(*) as count FROM lab_tests WHERE status = 'pending' AND deleted_at IS NULL`,
-    sql`SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE payment_date >= CURRENT_DATE`,
-  ])
+  const totalPatients = db.patients.length
+  const todayAppointments = db.appointments.filter(
+    (a) => (a as Record<string, unknown>).appointment_date === today
+  ).length
+  const currentAdmissions = db.admissions.filter(
+    (a) => (a as Record<string, unknown>).status === 'admitted'
+  ).length
+  const lowStockMedicines = db.medicines.filter((m) => {
+    const med = m as Record<string, unknown>
+    return Number(med.quantity_in_stock) <= Number(med.reorder_level) && med.is_active
+  }).length
+  const pendingLabTests = db.lab_tests.filter(
+    (t) => (t as Record<string, unknown>).status === 'pending'
+  ).length
+
+  const todayPayments = db.payments.filter(
+    (p) => (p as Record<string, unknown>).payment_date === today
+  )
+  const todayRevenue = todayPayments.reduce(
+    (sum, p) => sum + Number((p as Record<string, unknown>).amount),
+    0
+  )
 
   return NextResponse.json({
-    totalPatients: Number(patients[0].count),
-    todayAppointments: Number(todayAppointments[0].count),
-    currentAdmissions: Number(admissions[0].count),
-    lowStockMedicines: Number(medicines[0].count),
-    pendingLabTests: Number(labTests[0].count),
-    todayRevenue: Number(revenue[0].total),
+    totalPatients,
+    todayAppointments,
+    currentAdmissions,
+    lowStockMedicines,
+    pendingLabTests,
+    todayRevenue,
   })
 }
